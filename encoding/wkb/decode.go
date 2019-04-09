@@ -28,9 +28,18 @@ func decodeOrder(r io.ByteReader) (binary.ByteOrder, error) {
 	return order, nil
 }
 
-func decodeGeometryType(r io.Reader, order binary.ByteOrder, expectedGeometryType uint32) error {
+func decodeGeometryType(r io.Reader, order binary.ByteOrder) (uint32, error) {
 	var geometryType uint32
 	if err := binary.Read(r, order, &geometryType); err != nil {
+		return 0, err
+	}
+
+	return geometryType, nil
+}
+
+func verifyGeometryType(r io.Reader, order binary.ByteOrder, expectedGeometryType uint32) error {
+	geometryType, err := decodeGeometryType(r, order)
+	if err != nil {
 		return err
 	}
 
@@ -90,7 +99,7 @@ func decodeWKBPoint(r reader) (s2.LatLng, error) {
 		return s2.LatLng{}, err
 	}
 
-	if err := decodeGeometryType(r, order, wkbPoint); err != nil {
+	if err := verifyGeometryType(r, order, wkbPoint); err != nil {
 		return s2.LatLng{}, err
 	}
 
@@ -103,7 +112,7 @@ func decodeWKBLineString(r reader) (*s2.Polyline, error) {
 		return nil, err
 	}
 
-	if err := decodeGeometryType(r, order, wkbLineString); err != nil {
+	if err := verifyGeometryType(r, order, wkbLineString); err != nil {
 		return nil, err
 	}
 
@@ -125,16 +134,7 @@ func decodeWKBLineString(r reader) (*s2.Polyline, error) {
 	return s2.PolylineFromLatLngs(latLngs), nil
 }
 
-func decodeWKBPolygon(r reader) ([]*s2.Loop, error) {
-	order, err := decodeOrder(r)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := decodeGeometryType(r, order, wkbPolygon); err != nil {
-		return nil, err
-	}
-
+func decodePolygonLoopsPartial(r io.Reader, order binary.ByteOrder) ([]*s2.Loop, error) {
 	var nlr uint32
 	if err := binary.Read(r, order, &nlr); err != nil {
 		return nil, err
@@ -162,13 +162,35 @@ func decodeWKBPolygon(r reader) ([]*s2.Loop, error) {
 	return polygonLoops, nil
 }
 
+func decodeWKBPolygonLoops(r reader) ([]*s2.Loop, error) {
+	order, err := decodeOrder(r)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := verifyGeometryType(r, order, wkbPolygon); err != nil {
+		return nil, err
+	}
+
+	return decodePolygonLoopsPartial(r, order)
+}
+
+func decodeWKBPolygonPartial(r reader, order binary.ByteOrder) (*s2.Polygon, error) {
+	polygonLoops, err := decodePolygonLoopsPartial(r, order)
+	if err != nil {
+		return nil, err
+	}
+
+	return s2.PolygonFromLoops(polygonLoops), nil
+}
+
 func decodeWKBMultiPoint(r reader) ([]s2.Point, error) {
 	order, err := decodeOrder(r)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := decodeGeometryType(r, order, wkbMultiPoint); err != nil {
+	if err := verifyGeometryType(r, order, wkbMultiPoint); err != nil {
 		return nil, err
 	}
 
@@ -196,7 +218,7 @@ func decodeWKBMultiLineString(r reader) ([]*s2.Polyline, error) {
 		return nil, err
 	}
 
-	if err := decodeGeometryType(r, order, wkbMultiLineString); err != nil {
+	if err := verifyGeometryType(r, order, wkbMultiLineString); err != nil {
 		return nil, err
 	}
 
@@ -218,16 +240,7 @@ func decodeWKBMultiLineString(r reader) ([]*s2.Polyline, error) {
 	return polylines, nil
 }
 
-func decodeWKBMultiPolygon(r reader) ([]*s2.Loop, error) {
-	order, err := decodeOrder(r)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := decodeGeometryType(r, order, wkbMultiPolygon); err != nil {
-		return nil, err
-	}
-
+func decodeWKBMultiPolygonPartial(r reader, order binary.ByteOrder) (*s2.Polygon, error) {
 	var n uint32
 	if err := binary.Read(r, order, &n); err != nil {
 		return nil, err
@@ -235,7 +248,7 @@ func decodeWKBMultiPolygon(r reader) ([]*s2.Loop, error) {
 
 	multiPolygonLoops := make([]*s2.Loop, 0, n)
 	for i := uint32(0); i < n; i++ {
-		polygonLoops, err := decodeWKBPolygon(r)
+		polygonLoops, err := decodeWKBPolygonLoops(r)
 		if err != nil {
 			return nil, err
 		}
@@ -243,7 +256,28 @@ func decodeWKBMultiPolygon(r reader) ([]*s2.Loop, error) {
 		multiPolygonLoops = append(multiPolygonLoops, polygonLoops...)
 	}
 
-	return multiPolygonLoops, nil
+	return s2.PolygonFromLoops(multiPolygonLoops), nil
+}
+
+func decodeWKBPolygonOrMultiPolygon(r reader) (*s2.Polygon, error) {
+	order, err := decodeOrder(r)
+	if err != nil {
+		return nil, err
+	}
+
+	geometryType, err := decodeGeometryType(r, order)
+	if err != nil {
+		return nil, err
+	}
+
+	switch geometryType {
+	case wkbPolygon:
+		return decodeWKBPolygonPartial(r, order)
+	case wkbMultiPolygon:
+		return decodeWKBMultiPolygonPartial(r, order)
+	default:
+		return nil, fmt.Errorf("wkb: invalid geometry type %d, expected %d or %d", geometryType, wkbPolygon, wkbMultiPolygon)
+	}
 }
 
 func Unmarshal(data []byte, v interface{}) error {
@@ -272,6 +306,14 @@ func Unmarshal(data []byte, v interface{}) error {
 		}
 
 		*geometry = *lineString
+
+	case *s2.Polygon:
+		polygon, err := decodeWKBPolygonOrMultiPolygon(r)
+		if err != nil {
+			return err
+		}
+
+		*geometry = *polygon
 
 	case *[]s2.Point:
 		multiPoint, err := decodeWKBMultiPoint(r)
